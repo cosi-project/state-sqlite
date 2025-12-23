@@ -3,13 +3,13 @@ module github.com/cosi-project/state-sqlite
 go 1.25.3
 
 require (
-	github.com/cosi-project/runtime v1.12.0
-	github.com/siderolabs/gen v0.8.5
+	github.com/cosi-project/runtime v1.13.0
+	github.com/siderolabs/gen v0.8.6
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/goleak v1.3.0
-	go.uber.org/zap v1.27.0
-	golang.org/x/sync v0.17.0
-	modernc.org/sqlite v1.39.1
+	go.uber.org/zap v1.27.1
+	golang.org/x/sync v0.19.0
+	modernc.org/sqlite v1.41.0
 )
 
 require (

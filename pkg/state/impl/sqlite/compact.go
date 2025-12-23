@@ -44,13 +44,13 @@ func (s *State) Compact(ctx context.Context) (*CompactionInfo, error) {
 	// this works well enough even with gaps in event IDs
 	info.RemainingEvents = maxEventID - minEventID + 1
 
-	if info.RemainingEvents <= int64(s.options.CompactMaxEvents) {
+	if info.RemainingEvents <= int64(s.options.CompactKeepEvents) {
 		// no need to compact
 		return &info, nil
 	}
 
-	// pick cutoff event ID based on max events to keep
-	cutoffEventID := maxEventID - int64(s.options.CompactMaxEvents) + 1
+	// pick cutoff event ID based on min events to keep (don't drop more than CompactKeepEvents)
+	cutoffEventID := maxEventID - int64(s.options.CompactKeepEvents) + 1
 
 	// perform binary search on events table in the range [minEventID, cutoffEventID)
 	// to find the first event that is newer than min age

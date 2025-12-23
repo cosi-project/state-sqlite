@@ -48,7 +48,7 @@ func TestCompactNotEnoughEvents(t *testing.T) {
 		// should not compact yet, as max age is not reached
 		assert.EqualValues(t, 0, result.EventsCompacted)
 		assert.EqualValues(t, 20, result.RemainingEvents)
-	}, sqlite.WithCompactMaxEvents(10), sqlite.WithCompactionInterval(0))
+	}, sqlite.WithCompactKeepEvents(10), sqlite.WithCompactionInterval(0))
 }
 
 func TestCompactEvents(t *testing.T) {
@@ -72,5 +72,5 @@ func TestCompactEvents(t *testing.T) {
 		require.NoError(t, err)
 		assert.EqualValues(t, 20, result.EventsCompacted)
 		assert.EqualValues(t, 10, result.RemainingEvents)
-	}, sqlite.WithCompactMaxEvents(10), sqlite.WithCompactMinAge(-time.Minute), sqlite.WithCompactionInterval(0))
+	}, sqlite.WithCompactKeepEvents(10), sqlite.WithCompactMinAge(-time.Minute), sqlite.WithCompactionInterval(0))
 }

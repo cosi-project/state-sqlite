@@ -47,10 +47,13 @@ type StateOptions struct {
 	// Default is 30 minutes.
 	CompactionInterval time.Duration
 
-	// CompactMaxEvents is the maximum number of events to keep during compaction.
+	// CompactKeepEvents is the number of events to keep during compaction.
+	//
+	// This ensures tat at least this many events are kept in the database to avoid
+	// event ID wraparound and to allow watches to restart from recent bookmarks.
 	//
 	// Default is 1000.
-	CompactMaxEvents int
+	CompactKeepEvents int
 
 	// CompactMinAge is the minimum age of events to keep during compaction.
 	//
@@ -70,7 +73,7 @@ func DefaultStateOptions() StateOptions {
 		Logger:             zap.NewNop(),
 		TablePrefix:        "",
 		CompactionInterval: 30 * time.Minute,
-		CompactMaxEvents:   1000,
+		CompactKeepEvents:  1000,
 		CompactMinAge:      time.Hour,
 	}
 }
@@ -89,10 +92,10 @@ func WithCompactionInterval(interval time.Duration) StateOption {
 	}
 }
 
-// WithCompactMaxEvents sets the maximum number of events to keep during compaction.
-func WithCompactMaxEvents(maxEvents int) StateOption {
+// WithCompactKeepEvents sets the minimum number of events to keep during compaction.
+func WithCompactKeepEvents(keepEvents int) StateOption {
 	return func(opts *StateOptions) {
-		opts.CompactMaxEvents = maxEvents
+		opts.CompactKeepEvents = keepEvents
 	}
 }
 
