@@ -6,7 +6,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +14,8 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/gen/channel"
 	"github.com/siderolabs/gen/xslices"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 
 	"github.com/cosi-project/state-sqlite/pkg/state/impl/sqlite/internal/filter"
 )
@@ -96,7 +97,7 @@ func (st *State) convertEvent(resourcePointer resource.Kind, eventID int64, spec
 // Watch sends initial resource state as the very first event on the channel,
 // and then sends any updates to the resource as events.
 //
-//nolint:gocyclo,gocognit,cyclop
+//nolint:gocyclo,gocognit,cyclop,maintidx
 func (st *State) Watch(ctx context.Context, ptr resource.Pointer, ch chan<- state.Event, opts ...state.WatchOption) error {
 	var options state.WatchOptions
 
@@ -118,6 +119,13 @@ func (st *State) Watch(ctx context.Context, ptr resource.Pointer, ch chan<- stat
 		}
 	}()
 
+	conn, err := st.db.Take(ctx)
+	if err != nil {
+		return fmt.Errorf("taking connection for watch setup: %w", err)
+	}
+
+	defer st.db.Put(conn)
+
 	switch {
 	case options.TailEvents != 0:
 		return fmt.Errorf("failed to watch: %w", ErrUnsupported("tailEvents"))
@@ -129,84 +137,104 @@ func (st *State) Watch(ctx context.Context, ptr resource.Pointer, ch chan<- stat
 			return fmt.Errorf("failed to watch %q: %w", ptr, err)
 		}
 
-		// verify that we still have the event in the log
-		if err = st.db.QueryRowContext(ctx, `SELECT 1 FROM `+st.options.TablePrefix+`events
-		WHERE event_id = ?`,
-			eventID,
-		).Scan(
-			new(int),
-		); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("failed to watch %q: %w", ptr, ErrInvalidWatchBookmark(errors.New("bookmark refers to compacted event")))
-			}
+		var eventFound bool
 
+		// verify that we still have the event in the log
+		if err = sqlitex.Execute(conn, `SELECT 1 FROM `+st.options.TablePrefix+`events
+		WHERE event_id = $event_id`,
+			&sqlitex.ExecOptions{
+				Named: map[string]any{
+					"$event_id": eventID,
+				},
+				ResultFunc: func(stmt *sqlite.Stmt) error {
+					eventFound = true
+
+					return nil
+				},
+			},
+		); err != nil {
 			return fmt.Errorf("verifying bookmark for watch %q: %w", ptr, err)
+		}
+
+		if !eventFound {
+			return fmt.Errorf("failed to watch %q: %w", ptr, ErrInvalidWatchBookmark(errors.New("bookmark refers to compacted event")))
 		}
 
 		// as we start from a bookmark, mark the subscription as notified to make first event fetch
 		sub.TriggerNotify()
 	default:
 		// figure out initial state of the watch process
-		tx, err := st.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-		if err != nil {
-			return fmt.Errorf("starting watch transaction: %w", err)
-		}
+		err := func() (err error) {
+			defer sqlitex.Transaction(conn)(&err)
 
-		defer tx.Rollback() //nolint:errcheck
+			var spec []byte
 
-		var spec []byte
+			err = sqlitex.Execute(conn, `SELECT spec
+					FROM `+st.options.TablePrefix+`resources
+					WHERE namespace = $namespace AND type = $type AND id = $id`,
+				&sqlitex.ExecOptions{
+					Named: map[string]any{
+						"$namespace": ptr.Namespace(),
+						"$type":      ptr.Type(),
+						"$id":        ptr.ID(),
+					},
+					ResultFunc: func(stmt *sqlite.Stmt) error {
+						spec = make([]byte, stmt.GetLen("spec"))
+						stmt.GetBytes("spec", spec)
 
-		err = tx.QueryRowContext(ctx, `SELECT spec
-		FROM `+st.options.TablePrefix+`resources
-		WHERE namespace = ? AND type = ? AND id = ?`,
-			ptr.Namespace(),
-			ptr.Type(),
-			ptr.ID(),
-		).Scan(
-			&spec,
-		)
+						return nil
+					},
+				},
+			)
 
-		exists := true
+			exists := spec != nil
 
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				// resource doesn't exist yet
-				exists = false
-			} else {
+			if err != nil {
 				return fmt.Errorf("querying initial resource state for watch %q: %w", ptr, err)
 			}
-		}
 
-		if exists {
-			var res resource.Resource
+			if exists {
+				var res resource.Resource
 
-			res, err = st.marshaler.UnmarshalResource(spec)
-			if err != nil {
-				return fmt.Errorf("unmarshal initial resource state for watch %q: %w", ptr, err)
+				res, err = st.marshaler.UnmarshalResource(spec)
+				if err != nil {
+					return fmt.Errorf("unmarshal initial resource state for watch %q: %w", ptr, err)
+				}
+
+				initialEvent.Type = state.Created
+				initialEvent.Resource = res
+			} else {
+				initialEvent.Type = state.Destroyed
+				initialEvent.Resource = resource.NewTombstone(
+					resource.NewMetadata(
+						ptr.Namespace(),
+						ptr.Type(),
+						ptr.ID(),
+						resource.VersionUndefined,
+					),
+				)
 			}
 
-			initialEvent.Type = state.Created
-			initialEvent.Resource = res
-		} else {
-			initialEvent.Type = state.Destroyed
-			initialEvent.Resource = resource.NewTombstone(
-				resource.NewMetadata(
-					ptr.Namespace(),
-					ptr.Type(),
-					ptr.ID(),
-					resource.VersionUndefined,
-				),
+			err = sqlitex.Execute(conn, `SELECT coalesce(max(event_id), 0) AS max_event_id FROM `+st.options.TablePrefix+`events`,
+				&sqlitex.ExecOptions{
+					ResultFunc: func(stmt *sqlite.Stmt) error {
+						eventID = stmt.GetInt64("max_event_id")
+
+						return nil
+					},
+				},
 			)
-		}
+			if err != nil {
+				return fmt.Errorf("querying initial event ID for watch %q: %w", ptr, err)
+			}
 
-		err = tx.QueryRowContext(ctx, `SELECT coalesce(max(event_id), 0) FROM `+st.options.TablePrefix+`events`).Scan(
-			&eventID,
-		)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("querying initial event ID for watch %q: %w", ptr, err)
-		}
+			initialEvent.Bookmark = encodeBookmark(eventID)
 
-		initialEvent.Bookmark = encodeBookmark(eventID)
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
 	}
 
 	resourceNamespace, resourceType, resourceID := ptr.Namespace(), ptr.Type(), ptr.ID()
@@ -229,58 +257,53 @@ func (st *State) Watch(ctx context.Context, ptr resource.Pointer, ch chan<- stat
 			case <-sub.NotifyCh():
 			}
 
+			var events []state.Event
+
 			if err := func() error {
-				rows, err := st.db.QueryContext(ctx, `
+				conn, err := st.db.Take(ctx)
+				if err != nil {
+					return fmt.Errorf("taking connection for watch event: %w", err)
+				}
+
+				defer st.db.Put(conn)
+
+				err = sqlitex.Execute(conn, `
 					SELECT event_id, spec_before, spec_after, event_type
 					FROM `+st.options.TablePrefix+`events
-					WHERE event_id > ? AND namespace = ? AND type = ? AND id = ?
+					WHERE event_id > $event_id AND namespace = $namespace AND type = $type AND id = $id
 					ORDER BY event_id ASC`,
-					eventID,
-					resourceNamespace,
-					resourceType,
-					resourceID,
+					&sqlitex.ExecOptions{
+						Named: map[string]any{
+							"$event_id":  eventID,
+							"$namespace": resourceNamespace,
+							"$type":      resourceType,
+							"$id":        resourceID,
+						},
+						ResultFunc: func(stmt *sqlite.Stmt) error {
+							specBefore := make([]byte, stmt.GetLen("spec_before"))
+							stmt.GetBytes("spec_before", specBefore)
+
+							specAfter := make([]byte, stmt.GetLen("spec_after"))
+							stmt.GetBytes("spec_after", specAfter)
+
+							newEventID := stmt.GetInt64("event_id")
+							eventType := int(stmt.GetInt64("event_type"))
+
+							eventID = newEventID
+
+							event := st.convertEvent(ptr, eventID, specBefore, specAfter, eventType)
+							if event.Type == state.Errored {
+								return event.Error
+							}
+
+							events = append(events, event)
+
+							return nil
+						},
+					},
 				)
 				if err != nil {
-					if errors.Is(err, context.Canceled) {
-						return nil
-					}
-
 					return fmt.Errorf("querying events for watch %q: %w", ptr, err)
-				}
-
-				defer rows.Close() //nolint:errcheck
-
-				for rows.Next() {
-					var (
-						specBefore, specAfter []byte
-						newEventID            int64
-						eventType             int
-					)
-
-					if err = rows.Scan(
-						&newEventID,
-						&specBefore,
-						&specAfter,
-						&eventType,
-					); err != nil {
-						return fmt.Errorf("scanning event for watch %q: %w", ptr, err)
-					}
-
-					eventID = newEventID
-
-					event := st.convertEvent(ptr, eventID, specBefore, specAfter, eventType)
-					if event.Type == state.Errored {
-						return event.Error
-					}
-
-					if !channel.SendWithContext(ctx, ch, event) {
-						// If the channel is closed, we should stop the watch
-						return nil
-					}
-				}
-
-				if err = rows.Err(); err != nil {
-					return fmt.Errorf("iterating events for watch %q: %w", ptr, err)
 				}
 
 				return nil
@@ -289,6 +312,13 @@ func (st *State) Watch(ctx context.Context, ptr resource.Pointer, ch chan<- stat
 					Type:  state.Errored,
 					Error: fmt.Errorf("watching %q: %w", ptr, err),
 				})
+			}
+
+			for _, event := range events {
+				if !channel.SendWithContext(ctx, ch, event) {
+					// If the context is canceled, we should stop the watch
+					return
+				}
 			}
 		}
 	}()
@@ -329,6 +359,13 @@ func (st *State) watchKind(ctx context.Context, resourceKind resource.Kind, sing
 		}
 	}()
 
+	conn, err := st.db.Take(ctx)
+	if err != nil {
+		return fmt.Errorf("taking connection for watch kind setup: %w", err)
+	}
+
+	defer st.db.Put(conn)
+
 	var (
 		bootstrapList []resource.Resource
 		eventID       int64
@@ -347,79 +384,98 @@ func (st *State) watchKind(ctx context.Context, resourceKind resource.Kind, sing
 			return fmt.Errorf("failed to %s %q: %w", opName, resourceKind, err)
 		}
 
-		// verify that we still have the event in the log
-		if err = st.db.QueryRowContext(ctx, `SELECT 1 FROM `+st.options.TablePrefix+`events
-		WHERE event_id = ?`,
-			eventID,
-		).Scan(
-			new(int),
-		); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("failed to watch %q: %w", resourceKind, ErrInvalidWatchBookmark(errors.New("bookmark refers to compacted event")))
-			}
+		var eventFound bool
 
+		// verify that we still have the event in the log
+		if err = sqlitex.Execute(conn, `SELECT 1 FROM `+st.options.TablePrefix+`events
+		WHERE event_id = $event_id`,
+			&sqlitex.ExecOptions{
+				Named: map[string]any{
+					"$event_id": eventID,
+				},
+				ResultFunc: func(stmt *sqlite.Stmt) error {
+					eventFound = true
+
+					return nil
+				},
+			},
+		); err != nil {
 			return fmt.Errorf("verifying bookmark for watch %q: %w", resourceKind, err)
+		}
+
+		if !eventFound {
+			return fmt.Errorf("failed to watch %q: %w", resourceKind, ErrInvalidWatchBookmark(errors.New("bookmark refers to compacted event")))
 		}
 
 		// trigger notification to start fetching events from the bookmark
 		sub.TriggerNotify()
 	case options.BootstrapContents:
 		// figure out initial state of the watch process
-		tx, err := st.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-		if err != nil {
-			return fmt.Errorf("starting watch transaction: %w", err)
-		}
+		err := func() (err error) {
+			defer sqlitex.Transaction(conn)(&err)
 
-		defer tx.Rollback() //nolint:errcheck
+			err = sqlitex.Execute(conn, `SELECT spec
+					FROM `+st.options.TablePrefix+`resources
+					WHERE namespace = $namespace AND type = $type AND `+labelQuerySQL,
+				&sqlitex.ExecOptions{
+					Named: map[string]any{
+						"$namespace": resourceKind.Namespace(),
+						"$type":      resourceKind.Type(),
+					},
+					ResultFunc: func(stmt *sqlite.Stmt) error {
+						spec := make([]byte, stmt.GetLen("spec"))
+						stmt.GetBytes("spec", spec)
 
-		rows, err := st.db.QueryContext(ctx, `SELECT spec
-		FROM `+st.options.TablePrefix+`resources
-		WHERE namespace = ? AND type = ? AND `+labelQuerySQL,
-			resourceKind.Namespace(),
-			resourceKind.Type(),
-		)
-		if err != nil {
-			return fmt.Errorf("error querying resources of kind %q: %w", resourceKind, err)
-		}
+						var res resource.Resource
 
-		defer rows.Close() //nolint:errcheck
+						res, err = st.marshaler.UnmarshalResource(spec)
+						if err != nil {
+							return fmt.Errorf("failed to unmarshal resource of kind %q: %w", resourceKind, err)
+						}
 
-		for rows.Next() {
-			var spec []byte
+						if !matches(res) {
+							return nil
+						}
 
-			if err = rows.Scan(&spec); err != nil {
-				return fmt.Errorf("error scanning resource of kind %q: %w", resourceKind, err)
-			}
+						bootstrapList = append(bootstrapList, res)
 
-			var res resource.Resource
-
-			res, err = st.marshaler.UnmarshalResource(spec)
+						return nil
+					},
+				},
+			)
 			if err != nil {
-				return fmt.Errorf("failed to unmarshal resource of kind %q: %w", resourceKind, err)
+				return fmt.Errorf("error querying resources of kind %q: %w", resourceKind, err)
 			}
 
-			if !matches(res) {
-				continue
+			err = sqlitex.Execute(conn, `SELECT coalesce(max(event_id), 0) AS max_event_id FROM `+st.options.TablePrefix+`events`,
+				&sqlitex.ExecOptions{
+					ResultFunc: func(stmt *sqlite.Stmt) error {
+						eventID = stmt.GetInt64("max_event_id")
+
+						return nil
+					},
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("querying initial event ID for watch %s: %w", resourceKind, err)
 			}
 
-			bootstrapList = append(bootstrapList, res)
-		}
-
-		if err = rows.Err(); err != nil {
-			return fmt.Errorf("error iterating resources of kind %q: %w", resourceKind, err)
-		}
-
-		err = tx.QueryRowContext(ctx, `SELECT coalesce(max(event_id), 0) FROM `+st.options.TablePrefix+`events`).Scan(
-			&eventID,
-		)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("querying initial event ID for watch %q: %w", resourceKind, err)
+			return nil
+		}()
+		if err != nil {
+			return err
 		}
 	default:
-		err := st.db.QueryRowContext(ctx, `SELECT coalesce(max(event_id), 0) FROM `+st.options.TablePrefix+`events`).Scan(
-			&eventID,
+		err := sqlitex.Execute(conn, `SELECT coalesce(max(event_id), 0) AS max_event_id FROM `+st.options.TablePrefix+`events`,
+			&sqlitex.ExecOptions{
+				ResultFunc: func(stmt *sqlite.Stmt) error {
+					eventID = stmt.GetInt64("max_event_id")
+
+					return nil
+				},
+			},
 		)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err != nil {
 			return fmt.Errorf("querying initial event ID for watch %s: %w", resourceKind, err)
 		}
 	}
@@ -506,82 +562,77 @@ func (st *State) watchKind(ctx context.Context, resourceKind resource.Kind, sing
 			var events []state.Event
 
 			if queryErr := func() error {
-				rows, err := st.db.QueryContext(ctx, `
+				conn, err := st.db.Take(ctx)
+				if err != nil {
+					return fmt.Errorf("taking connection for watch kind event: %w", err)
+				}
+
+				defer st.db.Put(conn)
+
+				err = sqlitex.Execute(conn, `
 					SELECT event_id, spec_before, spec_after, event_type
 					FROM `+st.options.TablePrefix+`events
-					WHERE event_id > ? AND namespace = ? AND type = ?
+					WHERE event_id > $event_id AND namespace = $namespace AND type = $type
 					ORDER BY event_id ASC`,
-					eventID,
-					resourceNamespace,
-					resourceType,
+					&sqlitex.ExecOptions{
+						Named: map[string]any{
+							"$event_id":  eventID,
+							"$namespace": resourceNamespace,
+							"$type":      resourceType,
+						},
+						ResultFunc: func(stmt *sqlite.Stmt) error {
+							specBefore := make([]byte, stmt.GetLen("spec_before"))
+							stmt.GetBytes("spec_before", specBefore)
+
+							specAfter := make([]byte, stmt.GetLen("spec_after"))
+							stmt.GetBytes("spec_after", specAfter)
+
+							newEventID := stmt.GetInt64("event_id")
+							eventType := int(stmt.GetInt64("event_type"))
+
+							eventID = newEventID
+
+							event := st.convertEvent(resourceKind, eventID, specBefore, specAfter, eventType)
+							if event.Type == state.Errored {
+								return event.Error
+							}
+
+							switch event.Type {
+							case state.Created, state.Destroyed:
+								if !matches(event.Resource) {
+									// skip the event
+									return nil
+								}
+							case state.Updated:
+								oldMatches := matches(event.Old)
+								newMatches := matches(event.Resource)
+
+								switch {
+								// transform the event if matching fact changes with the update
+								case oldMatches && !newMatches:
+									event.Type = state.Destroyed
+									event.Old = nil
+								case !oldMatches && newMatches:
+									event.Type = state.Created
+									event.Old = nil
+								case newMatches && oldMatches:
+									// passthrough the event
+								default:
+									// skip the event
+									return nil
+								}
+							case state.Errored, state.Bootstrapped, state.Noop:
+								panic("should never be reached")
+							}
+
+							events = append(events, event)
+
+							return nil
+						},
+					},
 				)
 				if err != nil {
-					if errors.Is(err, context.Canceled) {
-						return err
-					}
-
 					return fmt.Errorf("querying events for watch %s: %w", resourceKind, err)
-				}
-
-				defer rows.Close() //nolint:errcheck
-
-				for rows.Next() {
-					var (
-						specBefore, specAfter []byte
-						newEventID            int64
-						eventType             int
-					)
-
-					err = rows.Scan(
-						&newEventID,
-						&specBefore,
-						&specAfter,
-						&eventType,
-					)
-					if err != nil {
-						return fmt.Errorf("scanning event for watch %s: %w", resourceKind, err)
-					}
-
-					eventID = newEventID
-
-					event := st.convertEvent(resourceKind, eventID, specBefore, specAfter, eventType)
-					if event.Type == state.Errored {
-						return event.Error
-					}
-
-					switch event.Type {
-					case state.Created, state.Destroyed:
-						if !matches(event.Resource) {
-							// skip the event
-							continue
-						}
-					case state.Updated:
-						oldMatches := matches(event.Old)
-						newMatches := matches(event.Resource)
-
-						switch {
-						// transform the event if matching fact changes with the update
-						case oldMatches && !newMatches:
-							event.Type = state.Destroyed
-							event.Old = nil
-						case !oldMatches && newMatches:
-							event.Type = state.Created
-							event.Old = nil
-						case newMatches && oldMatches:
-							// passthrough the event
-						default:
-							// skip the event
-							continue
-						}
-					case state.Errored, state.Bootstrapped, state.Noop:
-						panic("should never be reached")
-					}
-
-					events = append(events, event)
-				}
-
-				if err := rows.Err(); err != nil {
-					return fmt.Errorf("iterating events for watch %s: %w", resourceKind, err)
 				}
 
 				return nil

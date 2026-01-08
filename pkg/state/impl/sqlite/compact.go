@@ -11,6 +11,8 @@ import (
 
 	"github.com/siderolabs/gen/panicsafe"
 	"go.uber.org/zap"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // CompactionInfo holds information about a compaction operation.
@@ -20,18 +22,33 @@ type CompactionInfo struct {
 }
 
 // Compact performs database compaction.
-func (s *State) Compact(ctx context.Context) (*CompactionInfo, error) {
-	s.compactMu.Lock()
-	defer s.compactMu.Unlock()
+func (st *State) Compact(ctx context.Context) (*CompactionInfo, error) {
+	st.compactMu.Lock()
+	defer st.compactMu.Unlock()
+
+	conn, err := st.db.Take(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error taking connection for compaction: %w", err)
+	}
+
+	defer st.db.Put(conn)
 
 	var (
 		minEventID, maxEventID int64
 		info                   CompactionInfo
 	)
 
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT coalesce(min(event_id), 0), coalesce(max(event_id), 0) FROM `+s.options.TablePrefix+`events`,
-	).Scan(&minEventID, &maxEventID); err != nil {
+	if err = sqlitex.Execute(conn,
+		`SELECT coalesce(min(event_id), 0) AS min_event_id, coalesce(max(event_id), 0) AS max_event_id FROM `+st.options.TablePrefix+`events`,
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				minEventID = stmt.GetInt64("min_event_id")
+				maxEventID = stmt.GetInt64("max_event_id")
+
+				return nil
+			},
+		},
+	); err != nil {
 		return nil, fmt.Errorf("failed to get event ID range for compaction: %w", err)
 	}
 
@@ -44,17 +61,17 @@ func (s *State) Compact(ctx context.Context) (*CompactionInfo, error) {
 	// this works well enough even with gaps in event IDs
 	info.RemainingEvents = maxEventID - minEventID + 1
 
-	if info.RemainingEvents <= int64(s.options.CompactKeepEvents) {
+	if info.RemainingEvents <= int64(st.options.CompactKeepEvents) {
 		// no need to compact
 		return &info, nil
 	}
 
 	// pick cutoff event ID based on min events to keep (don't drop more than CompactKeepEvents)
-	cutoffEventID := maxEventID - int64(s.options.CompactKeepEvents) + 1
+	cutoffEventID := maxEventID - int64(st.options.CompactKeepEvents) + 1
 
 	// perform binary search on events table in the range [minEventID, cutoffEventID)
 	// to find the first event that is newer than min age
-	cutoffTime := time.Now().Add(-s.options.CompactMinAge).Unix()
+	cutoffTime := time.Now().Add(-st.options.CompactMinAge).Unix()
 
 	var (
 		left, right    = minEventID, cutoffEventID
@@ -69,12 +86,27 @@ func (s *State) Compact(ctx context.Context) (*CompactionInfo, error) {
 			break
 		}
 
-		if err := s.db.QueryRowContext(ctx,
+		eventTimestamp = 0
+
+		if err = sqlitex.Execute(conn,
 			// event_id might have gaps, so we use max(event_id) < mid to find the closest one
-			`SELECT max(event_id), event_timestamp FROM `+s.options.TablePrefix+`events WHERE event_id < ?`,
-			mid,
-		).Scan(new(int64), &eventTimestamp); err != nil {
+			`SELECT max(event_id), event_timestamp FROM `+st.options.TablePrefix+`events WHERE event_id < $mid`,
+			&sqlitex.ExecOptions{
+				Named: map[string]any{
+					"$mid": mid,
+				},
+				ResultFunc: func(stmt *sqlite.Stmt) error {
+					eventTimestamp = stmt.GetInt64("event_timestamp")
+
+					return nil
+				},
+			},
+		); err != nil {
 			return nil, fmt.Errorf("failed to get event timestamp for compaction: %w", err)
+		}
+
+		if eventTimestamp == 0 {
+			return nil, fmt.Errorf("failed to find event timestamp for event ID less than %d", mid)
 		}
 
 		if eventTimestamp < cutoffTime {
@@ -95,21 +127,22 @@ func (s *State) Compact(ctx context.Context) (*CompactionInfo, error) {
 	// we will delete in batches of 1000 to avoid long transactions
 
 	for {
-		res, err := s.db.ExecContext(ctx,
-			`DELETE FROM `+s.options.TablePrefix+`events WHERE event_id IN (SELECT event_id FROM `+s.options.TablePrefix+`events WHERE event_id < ? LIMIT 1000)`,
-			cutoffEventID,
+		err = sqlitex.Execute(conn,
+			`DELETE FROM `+st.options.TablePrefix+`events WHERE event_id IN (SELECT event_id FROM `+st.options.TablePrefix+`events WHERE event_id < $cutoff LIMIT 1000)`,
+			&sqlitex.ExecOptions{
+				Named: map[string]any{
+					"$cutoff": cutoffEventID,
+				},
+			},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to delete old events during compaction: %w", err)
 		}
 
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get rows affected during compaction: %w", err)
-		}
+		rowsAffected := conn.Changes()
 
-		info.EventsCompacted += rowsAffected
-		info.RemainingEvents -= rowsAffected
+		info.EventsCompacted += int64(rowsAffected)
+		info.RemainingEvents -= int64(rowsAffected)
 
 		if rowsAffected == 0 {
 			// done
@@ -120,10 +153,10 @@ func (s *State) Compact(ctx context.Context) (*CompactionInfo, error) {
 	return &info, nil
 }
 
-func (s *State) runCompaction() {
-	defer s.wg.Done()
+func (st *State) runCompaction() {
+	defer st.wg.Done()
 
-	ticker := time.NewTicker(s.options.CompactionInterval)
+	ticker := time.NewTicker(st.options.CompactionInterval)
 	defer ticker.Stop()
 
 	for {
@@ -133,21 +166,21 @@ func (s *State) runCompaction() {
 		)
 
 		err = panicsafe.RunErrF(func() error {
-			info, err = s.Compact(s.compactionCtx)
+			info, err = st.Compact(st.compactionCtx)
 
 			return err
 		})()
 		if err != nil {
-			s.options.Logger.Error("failed to compact database", zap.Error(err))
+			st.options.Logger.Error("failed to compact database", zap.Error(err))
 		} else {
-			s.options.Logger.Info("database compaction completed",
+			st.options.Logger.Info("database compaction completed",
 				zap.Int64("events_compacted", info.EventsCompacted),
 				zap.Int64("remaining_events", info.RemainingEvents),
 			)
 		}
 
 		select {
-		case <-s.shutdown:
+		case <-st.shutdown:
 			return
 		case <-ticker.C:
 		}

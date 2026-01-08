@@ -9,7 +9,7 @@ require (
 	go.uber.org/goleak v1.3.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/sync v0.19.0
-	modernc.org/sqlite v1.41.0
+	zombiezen.com/go/sqlite v1.4.2
 )
 
 require (
@@ -42,4 +42,5 @@ require (
 	modernc.org/libc v1.66.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	modernc.org/sqlite v1.41.0 // indirect
 )

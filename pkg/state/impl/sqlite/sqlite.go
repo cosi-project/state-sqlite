@@ -7,20 +7,20 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"sync"
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/impl/store"
 	"go.uber.org/zap"
+	"zombiezen.com/go/sqlite/sqlitex"
 
 	"github.com/cosi-project/state-sqlite/pkg/state/impl/sqlite/internal/sub"
 )
 
 // State implements state storage in sqlite database.
 type State struct {
-	db                  *sql.DB
+	db                  *sqlitex.Pool
 	marshaler           store.Marshaler
 	sub                 *sub.Manager
 	shutdown            chan struct{}
@@ -119,10 +119,11 @@ var _ state.CoreState = &State{}
 // NewState creates new State with default options.
 //
 // The following options should be enabled on the sqlite database:
+// [TODO]: update this comment when we finalize the required options
 //   - busy_timeout pragma should be set to a reasonable value (e.g. 5000 ms)
 //   - journal_mode pragma should be set to WAL
 //   - txlock=immediate should be set in the DSN to avoid busy errors on concurrent writes.
-func NewState(ctx context.Context, db *sql.DB, marshaler store.Marshaler, opts ...StateOption) (*State, error) {
+func NewState(ctx context.Context, db *sqlitex.Pool, marshaler store.Marshaler, opts ...StateOption) (*State, error) {
 	compactionCtx, compactionCtxCancel := context.WithCancel(context.Background())
 
 	st := &State{
@@ -153,8 +154,8 @@ func NewState(ctx context.Context, db *sql.DB, marshaler store.Marshaler, opts .
 }
 
 // Close shuts down the state and releases all resources.
-func (s *State) Close() {
-	s.compactionCtxCancel()
-	close(s.shutdown)
-	s.wg.Wait()
+func (st *State) Close() {
+	st.compactionCtxCancel()
+	close(st.shutdown)
+	st.wg.Wait()
 }
