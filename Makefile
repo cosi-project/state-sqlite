@@ -1,6 +1,6 @@
 # THIS FILE WAS AUTOMATICALLY GENERATED, PLEASE DO NOT EDIT.
 #
-# Generated on 2025-12-23T10:00:41Z by kres 26be706.
+# Generated on 2026-02-05T10:42:22Z by kres dc032d7.
 
 # common variables
 
@@ -20,14 +20,14 @@ USERNAME ?= cosi-project
 REGISTRY_AND_USERNAME ?= $(REGISTRY)/$(USERNAME)
 PROTOBUF_GO_VERSION ?= 1.36.11
 GRPC_GO_VERSION ?= 1.6.0
-GRPC_GATEWAY_VERSION ?= 2.27.3
+GRPC_GATEWAY_VERSION ?= 2.27.4
 VTPROTOBUF_VERSION ?= 0.6.0
-GOIMPORTS_VERSION ?= 0.40.0
+GOIMPORTS_VERSION ?= 0.41.0
 GOMOCK_VERSION ?= 0.6.0
 DEEPCOPY_VERSION ?= v0.5.8
-GOLANGCILINT_VERSION ?= v2.7.2
+GOLANGCILINT_VERSION ?= v2.8.0
 GOFUMPT_VERSION ?= v0.9.2
-GO_VERSION ?= 1.25.5
+GO_VERSION ?= 1.25.6
 GO_BUILDFLAGS ?=
 GO_BUILDTAGS ?= ,
 GO_LDFLAGS ?=
@@ -46,6 +46,7 @@ PLATFORM ?= linux/amd64
 PROGRESS ?= auto
 PUSH ?= false
 CI_ARGS ?=
+WITH_BUILD_DEBUG ?=
 BUILDKIT_MULTI_PLATFORM ?=
 COMMON_ARGS = --file=Dockerfile
 COMMON_ARGS += --provenance=false
@@ -127,6 +128,10 @@ respectively.
 
 endef
 
+ifneq (, $(filter $(WITH_BUILD_DEBUG), t true TRUE y yes 1))
+BUILD := BUILDX_EXPERIMENTAL=1 docker buildx debug --invoke /bin/sh --on error build
+endif
+
 ifneq (, $(filter $(WITH_RACE), t true TRUE y yes 1))
 GO_BUILDFLAGS += -race
 CGO_ENABLED := 1
@@ -165,6 +170,10 @@ local-%:  ## Builds the specified target defined in the Dockerfile using the loc
 	      rmdir "$$DEST/$$directory/"; \
 	    fi; \
 	  done'
+
+.PHONY: check-dirty
+check-dirty:
+	@if test -n "`git status --porcelain`"; then echo "Source tree is dirty"; git status; git diff; exit 1 ; fi
 
 lint-golangci-lint:  ## Runs golangci-lint linter.
 	@$(MAKE) target-$@

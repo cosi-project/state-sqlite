@@ -6,13 +6,14 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/state"
+	"zombiezen.com/go/sqlite"
 
+	"github.com/cosi-project/state-sqlite/pkg/sqlitexx"
 	"github.com/cosi-project/state-sqlite/pkg/state/impl/sqlite/internal/filter"
 )
 
@@ -26,19 +27,38 @@ func (st *State) Get(ctx context.Context, ptr resource.Pointer, opts ...state.Ge
 		opt(&options)
 	}
 
+	conn, err := st.db.Take(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("taking connection for get: %w", err)
+	}
+
+	defer st.db.Put(conn)
+
 	var spec []byte
 
-	err := st.db.QueryRowContext(ctx, `SELECT spec
+	q, err := sqlitexx.NewQuery(conn,
+		`SELECT spec
 		FROM `+st.options.TablePrefix+`resources
-		WHERE namespace = ? AND type = ? AND id = ?`,
-		ptr.Namespace(),
-		ptr.Type(),
-		ptr.ID(),
-	).Scan(
-		&spec,
+		WHERE namespace = $namespace AND type = $type AND id = $id`,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("preparing query for resource %q: %w", ptr, err)
+	}
+
+	err = q.
+		BindString("$namespace", ptr.Namespace()).
+		BindString("$type", ptr.Type()).
+		BindString("$id", ptr.ID()).
+		QueryRow(
+			func(stmt *sqlite.Stmt) error {
+				spec = make([]byte, stmt.GetLen("spec"))
+				stmt.GetBytes("spec", spec)
+
+				return nil
+			},
+		)
+	if err != nil {
+		if errors.Is(err, sqlitexx.ErrNoRows) {
 			return nil, fmt.Errorf("failed to get: %w", ErrNotFound(ptr))
 		}
 
@@ -65,41 +85,51 @@ func (st *State) List(ctx context.Context, resourceKind resource.Kind, opts ...s
 		return options.LabelQueries.Matches(*res.Metadata().Labels()) && options.IDQuery.Matches(*res.Metadata())
 	}
 
-	rows, err := st.db.QueryContext(ctx, `SELECT spec
-		FROM `+st.options.TablePrefix+`resources
-		WHERE namespace = ? AND type = ? AND `+filter.CompileLabelQueries(options.LabelQueries),
-		resourceKind.Namespace(),
-		resourceKind.Type(),
-	)
+	conn, err := st.db.Take(ctx)
 	if err != nil {
-		return resource.List{}, fmt.Errorf("error querying resources of kind %q: %w", resourceKind, err)
+		return resource.List{}, fmt.Errorf("taking connection for get: %w", err)
 	}
 
-	defer rows.Close() //nolint:errcheck
+	defer st.db.Put(conn)
 
 	var result resource.List
 
-	for rows.Next() {
-		var spec []byte
-
-		if err := rows.Scan(&spec); err != nil {
-			return resource.List{}, fmt.Errorf("error scanning resource of kind %q: %w", resourceKind, err)
-		}
-
-		res, err := st.marshaler.UnmarshalResource(spec)
-		if err != nil {
-			return resource.List{}, fmt.Errorf("failed to unmarshal resource of kind %q: %w", resourceKind, err)
-		}
-
-		if !matches(res) {
-			continue
-		}
-
-		result.Items = append(result.Items, res)
+	q, err := sqlitexx.NewQuery(
+		conn,
+		`SELECT spec
+		FROM `+st.options.TablePrefix+`resources
+		WHERE namespace = $namespace AND type = $type AND `+filter.CompileLabelQueries(options.LabelQueries),
+	)
+	if err != nil {
+		return resource.List{}, fmt.Errorf("preparing query for resources of kind %q: %w", resourceKind, err)
 	}
 
-	if err := rows.Err(); err != nil {
-		return resource.List{}, fmt.Errorf("error iterating over resources of kind %q: %w", resourceKind, err)
+	err = q.
+		BindString("$namespace", resourceKind.Namespace()).
+		BindString("$type", resourceKind.Type()).
+		QueryAll(
+			func(stmt *sqlite.Stmt) error {
+				spec := make([]byte, stmt.GetLen("spec"))
+				stmt.GetBytes("spec", spec)
+
+				var res resource.Resource
+
+				res, err = st.marshaler.UnmarshalResource(spec)
+				if err != nil {
+					return fmt.Errorf("failed to unmarshal resource of kind %q: %w", resourceKind, err)
+				}
+
+				if !matches(res) {
+					return nil
+				}
+
+				result.Items = append(result.Items, res)
+
+				return nil
+			},
+		)
+	if err != nil {
+		return resource.List{}, fmt.Errorf("error querying resources of kind %q: %w", resourceKind, err)
 	}
 
 	return result, nil

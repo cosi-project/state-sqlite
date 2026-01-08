@@ -5,22 +5,14 @@
 package sqlite
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/cosi-project/runtime/pkg/resource"
+	"zombiezen.com/go/sqlite"
 )
 
 func isUniqueViolationError(err error) bool {
-	var sqliteErr interface{ Code() int }
-
-	if ok := errors.As(err, &sqliteErr); !ok {
-		return false
-	}
-
-	// try to avoid importing sqlite package just to keep it generic
-	// const SQLITE_CONSTRAINT_PRIMARYKEY = 1555
-	return sqliteErr.Code() == 1555
+	return sqlite.ErrCode(err) == sqlite.ResultConstraintPrimaryKey
 }
 
 //nolint:errname

@@ -5,7 +5,6 @@
 package sqlite_test
 
 import (
-	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,7 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	"go.uber.org/zap/zaptest"
-	_ "modernc.org/sqlite"
+	zombiesqlite "zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 
 	"github.com/cosi-project/state-sqlite/pkg/state/impl/sqlite"
 )
@@ -46,14 +46,19 @@ func withSqliteCore(t testing.TB, fn func(*sqlite.State), opts ...sqlite.StateOp
 
 	dir := t.TempDir()
 
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "state.db")+"?_txlock=immediate&_pragma=busy_timeout(50000)&_pragma=journal_mode(WAL)")
+	pool, err := sqlitex.NewPool("file:"+filepath.Join(dir, "state.db"),
+		sqlitex.PoolOptions{
+			Flags:    zombiesqlite.OpenReadWrite | zombiesqlite.OpenCreate | zombiesqlite.OpenWAL | zombiesqlite.OpenURI,
+			PoolSize: 16,
+		},
+	)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		require.NoError(t, db.Close())
+		require.NoError(t, pool.Close())
 	})
 
-	coreState, err := sqlite.NewState(t.Context(), db, store.ProtobufMarshaler{},
+	coreState, err := sqlite.NewState(t.Context(), pool, store.ProtobufMarshaler{},
 		append(
 			[]sqlite.StateOption{
 				sqlite.WithTablePrefix("test_"),
