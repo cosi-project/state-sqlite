@@ -25,9 +25,13 @@ func TestSimpleOps(t *testing.T) {
 
 		path1 := conformance.NewPathResource("ns1", "var/run")
 
+		_, err := st.Get(ctx, path1.Metadata())
+		require.Error(t, err)
+		require.True(t, state.IsNotFoundError(err))
+
 		require.NoError(t, st.Create(ctx, path1))
 
-		err := st.Create(ctx, path1)
+		err = st.Create(ctx, path1)
 		require.Error(t, err)
 		require.True(t, state.IsConflictError(err))
 
@@ -48,6 +52,28 @@ func TestSimpleOps(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Equal(t, path2.Metadata().Owner(), path2Back.Metadata().Owner())
+	})
+}
+
+func TestFinalizers(t *testing.T) {
+	t.Parallel()
+
+	withSqlite(t, func(st state.State) {
+		ctx := t.Context()
+
+		path1 := conformance.NewPathResource("ns1", "var/run")
+		path1.Metadata().Finalizers().Add("bar")
+
+		require.NoError(t, st.Create(ctx, path1))
+		require.NoError(t, st.AddFinalizer(ctx, path1.Metadata(), "foo"))
+
+		path1Back, err := st.Get(ctx, path1.Metadata())
+		require.NoError(t, err)
+
+		require.True(t, path1Back.Metadata().Finalizers().Has("foo"))
+		require.True(t, path1Back.Metadata().Finalizers().Has("bar"))
+
+		require.Error(t, st.Destroy(ctx, path1.Metadata()))
 	})
 }
 
