@@ -18,8 +18,8 @@ import (
 	"go.uber.org/goleak"
 	"go.uber.org/zap/zaptest"
 	zombiesqlite "zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
 
+	"github.com/cosi-project/state-sqlite/pkg/sqlitexx"
 	"github.com/cosi-project/state-sqlite/pkg/state/impl/sqlite"
 )
 
@@ -46,10 +46,11 @@ func withSqliteCore(t testing.TB, fn func(*sqlite.State), opts ...sqlite.StateOp
 
 	dir := t.TempDir()
 
-	pool, err := sqlitex.NewPool("file:"+filepath.Join(dir, "state.db"),
-		sqlitex.PoolOptions{
-			Flags:    zombiesqlite.OpenReadWrite | zombiesqlite.OpenCreate | zombiesqlite.OpenWAL | zombiesqlite.OpenURI,
-			PoolSize: 16,
+	pool, err := sqlitexx.NewPool("file:"+filepath.Join(dir, "state.db"),
+		sqlitexx.PoolOptions{
+			Flags:         zombiesqlite.OpenReadWrite | zombiesqlite.OpenCreate | zombiesqlite.OpenWAL | zombiesqlite.OpenURI,
+			LowWatermark:  2,
+			HighWatermark: 16,
 		},
 	)
 	require.NoError(t, err)

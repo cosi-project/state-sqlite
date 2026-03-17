@@ -13,14 +13,20 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/impl/store"
 	"go.uber.org/zap"
-	"zombiezen.com/go/sqlite/sqlitex"
+	"zombiezen.com/go/sqlite"
 
 	"github.com/cosi-project/state-sqlite/pkg/state/impl/sqlite/internal/sub"
 )
 
+// SqlitexPool is an interface that abstracts the connection pool used by the sqlite state.
+type SqlitexPool interface {
+	Take(context.Context) (*sqlite.Conn, error)
+	Put(*sqlite.Conn)
+}
+
 // State implements state storage in sqlite database.
 type State struct {
-	db                  *sqlitex.Pool
+	db                  SqlitexPool
 	marshaler           store.Marshaler
 	sub                 *sub.Manager
 	shutdown            chan struct{}
@@ -123,7 +129,7 @@ var _ state.CoreState = &State{}
 //   - busy_timeout pragma should be set to a reasonable value (e.g. 5000 ms)
 //   - journal_mode pragma should be set to WAL
 //   - txlock=immediate should be set in the DSN to avoid busy errors on concurrent writes.
-func NewState(ctx context.Context, db *sqlitex.Pool, marshaler store.Marshaler, opts ...StateOption) (*State, error) {
+func NewState(ctx context.Context, db SqlitexPool, marshaler store.Marshaler, opts ...StateOption) (*State, error) {
 	compactionCtx, compactionCtxCancel := context.WithCancel(context.Background())
 
 	st := &State{
