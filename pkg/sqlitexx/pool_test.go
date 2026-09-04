@@ -6,8 +6,10 @@ package sqlitexx_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	zombiesqlite "zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 
 	"github.com/cosi-project/state-sqlite/pkg/sqlitexx"
 )
@@ -440,4 +443,140 @@ func TestPoolTakeAfterClose(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
+}
+
+func TestPoolPrepareConn(t *testing.T) {
+	t.Parallel()
+
+	pool := newTestPool(t, sqlitexx.PoolOptions{
+		LowWatermark:  3,
+		HighWatermark: 3,
+		PrepareConn: func(conn *zombiesqlite.Conn) error {
+			return sqlitex.ExecuteTransient(conn, "PRAGMA synchronous=NORMAL", nil)
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// take every connection the pool can open, so that each one is a fresh one prepared by the hook
+	conns := make([]*zombiesqlite.Conn, 0, 3)
+
+	for range 3 {
+		conn, err := pool.Take(ctx)
+		require.NoError(t, err)
+
+		conns = append(conns, conn)
+	}
+
+	for _, conn := range conns {
+		var mode int64
+
+		require.NoError(t, sqlitex.ExecuteTransient(conn, "PRAGMA synchronous", &sqlitex.ExecOptions{
+			ResultFunc: func(stmt *zombiesqlite.Stmt) error {
+				mode = stmt.ColumnInt64(0)
+
+				return nil
+			},
+		}))
+
+		assert.EqualValues(t, 1, mode, "synchronous should be NORMAL (1)")
+
+		pool.Put(conn)
+	}
+}
+
+func TestPoolPrepareConnError(t *testing.T) {
+	t.Parallel()
+
+	prepareErr := errors.New("prepare failed")
+
+	var failures atomic.Int32
+
+	failures.Store(1)
+
+	// a single connection: a failed preparation must give its slot back, otherwise the second Take blocks
+	pool := newTestPool(t, sqlitexx.PoolOptions{
+		LowWatermark:  1,
+		HighWatermark: 1,
+		PrepareConn: func(conn *zombiesqlite.Conn) error {
+			if failures.Add(-1) >= 0 {
+				return prepareErr
+			}
+
+			return sqlitex.ExecuteTransient(conn, "PRAGMA synchronous=NORMAL", nil)
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	_, err := pool.Take(ctx)
+	require.ErrorIs(t, err, prepareErr)
+
+	conn, err := pool.Take(ctx)
+	require.NoError(t, err)
+
+	var mode int64
+
+	require.NoError(t, sqlitex.ExecuteTransient(conn, "PRAGMA synchronous", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *zombiesqlite.Stmt) error {
+			mode = stmt.ColumnInt64(0)
+
+			return nil
+		},
+	}))
+
+	assert.EqualValues(t, 1, mode)
+
+	pool.Put(conn)
+}
+
+func TestPoolCloseDuringPrepareConn(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+
+	// the hook keeps the connection busy until it is interrupted, as a hook blocked in sqlite would be
+	pool, err := sqlitexx.NewPool("file:"+filepath.Join(t.TempDir(), "test.db"), sqlitexx.PoolOptions{
+		Flags: zombiesqlite.OpenReadWrite | zombiesqlite.OpenCreate | zombiesqlite.OpenWAL | zombiesqlite.OpenURI,
+		PrepareConn: func(conn *zombiesqlite.Conn) error {
+			close(started)
+
+			for {
+				if err := sqlitex.ExecuteTransient(conn, "SELECT 1", nil); err != nil {
+					return err
+				}
+			}
+		},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	takeErr := make(chan error, 1)
+
+	go func() {
+		_, takeE := pool.Take(ctx)
+		takeErr <- takeE
+	}()
+
+	<-started
+
+	closeErr := make(chan error, 1)
+
+	go func() {
+		closeErr <- pool.Close()
+	}()
+
+	// Close must interrupt the hook and return, and Take must not hand out a connection
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not return while the prepare hook was running")
+	}
+
+	require.Error(t, <-takeErr)
 }

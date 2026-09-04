@@ -21,6 +21,12 @@ func init() {
 
 // PoolOptions configures [NewPool].
 type PoolOptions struct {
+	// PrepareConn is called on every newly opened connection before it is handed out.
+	// It is meant for the connection-specific state such as the pragmas, which SQLite
+	// does not take from the URI. When it returns an error, the connection is closed
+	// and Take fails with that error.
+	PrepareConn func(conn *sqlite.Conn) error
+
 	// Flags is interpreted the same way as the argument to [sqlite.Open].
 	// A Flags value of 0 defaults to:
 	//
@@ -54,6 +60,7 @@ type Pool struct { //nolint:govet
 	flags         sqlite.OpenFlags
 	lowWatermark  int
 	highWatermark int
+	prepareConn   func(conn *sqlite.Conn) error
 
 	mu         sync.Mutex
 	free       []*sqlite.Conn
@@ -103,12 +110,29 @@ func NewPool(uri string, opts PoolOptions) (*Pool, error) {
 		flags:         flags,
 		lowWatermark:  lowWM,
 		highWatermark: highWM,
+		prepareConn:   opts.PrepareConn,
 		inUse:         make(map[*sqlite.Conn]context.CancelFunc),
 		closedChan:    make(chan struct{}),
 		avail:         make(chan struct{}),
 	}
 
 	return p, nil
+}
+
+// discard closes a connection which is not handed out, and drops it from the accounting.
+func (p *Pool) discard(conn *sqlite.Conn, cancel context.CancelFunc) {
+	conn.SetInterrupt(nil)
+	cancel()
+
+	p.mu.Lock()
+	delete(p.inUse, conn)
+	p.totalConns--
+	p.mu.Unlock()
+
+	conn.Close() //nolint:errcheck
+	p.wg.Done()
+	poolConnections.Add(-1)
+	p.notify()
 }
 
 // Take returns an SQLite connection from the Pool.
@@ -149,14 +173,7 @@ func (p *Pool) Take(ctx context.Context) (*sqlite.Conn, error) {
 			if p.closed {
 				// Pool was closed while we were preparing the connection.
 				p.mu.Unlock()
-				conn.SetInterrupt(nil)
-				cancel()
-				p.mu.Lock()
-				p.totalConns--
-				p.mu.Unlock()
-				conn.Close() //nolint:errcheck
-				p.wg.Done()
-				poolConnections.Add(-1)
+				p.discard(conn, cancel)
 
 				return nil, fmt.Errorf("get sqlite connection: pool closed")
 			}
@@ -189,8 +206,26 @@ func (p *Pool) Take(ctx context.Context) (*sqlite.Conn, error) {
 			conn.SetInterrupt(ctx2.Done())
 
 			p.mu.Lock()
+
+			if p.closed {
+				p.mu.Unlock()
+				p.discard(conn, cancel)
+
+				return nil, fmt.Errorf("get sqlite connection: pool closed")
+			}
+
 			p.inUse[conn] = cancel
 			p.mu.Unlock()
+
+			// The hook runs on a registered connection with the caller's interrupt set.
+			// This way, a blocking statement in it is canceled by the caller's context and by Close.
+			if p.prepareConn != nil {
+				if err = p.prepareConn(conn); err != nil {
+					p.discard(conn, cancel)
+
+					return nil, fmt.Errorf("prepare sqlite connection: %w", err)
+				}
+			}
 
 			return conn, nil
 		}
