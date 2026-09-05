@@ -80,7 +80,7 @@ func ErrAlreadyExists(r resource.Reference) error {
 // ErrVersionConflict generates error compatible with state.ErrConflict.
 func ErrVersionConflict(r resource.Pointer, expected, found uint64) error {
 	return eConflict{
-		error:    fmt.Errorf("resource %s update conflict: expected version %q, actual version %q", r, expected, found),
+		error:    fmt.Errorf("resource %s update conflict: expected version %d, actual version %d", r, expected, found),
 		resource: r,
 	}
 }
