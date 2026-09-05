@@ -75,6 +75,13 @@ type Pool struct { //nolint:govet
 
 	// wg counts all live connections (idle + in-use).
 	wg sync.WaitGroup
+
+	// openMu serializes the opening of the connections. Enabling the WAL mode on a fresh
+	// database fails when two connections do it at the same time: SQLite returns the busy
+	// error right away instead of running the busy handler, so a longer timeout does not help.
+	// This covers the connections of this pool only, two pools must not open a fresh database
+	// at the same time.
+	openMu sync.Mutex
 }
 
 // NewPool opens a dynamically-sized pool of SQLite connections.
@@ -189,7 +196,10 @@ func (p *Pool) Take(ctx context.Context) (*sqlite.Conn, error) {
 			p.totalConns++
 			p.mu.Unlock()
 
+			p.openMu.Lock()
 			conn, err := sqlite.OpenConn(p.uri, p.flags)
+			p.openMu.Unlock()
+
 			if err != nil {
 				p.mu.Lock()
 				p.totalConns--
